@@ -3,9 +3,9 @@ import 'dart:async';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:get/get.dart';
 import 'package:provider/provider.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 
 import '../../consts.dart';
@@ -72,7 +72,10 @@ class RemotePage extends StatefulWidget {
 }
 
 class _RemotePageState extends State<RemotePage>
-    with AutomaticKeepAliveClientMixin, MultiWindowListener {
+    with
+        AutomaticKeepAliveClientMixin,
+        MultiWindowListener,
+        TickerProviderStateMixin {
   Timer? _timer;
   String keyboardMode = "legacy";
   bool _isWindowBlur = false;
@@ -81,6 +84,7 @@ class _RemotePageState extends State<RemotePage>
   late RxBool _zoomCursor;
   late RxBool _remoteCursorMoved;
   late RxBool _keyboardEnabled;
+  final _uniqueKey = UniqueKey();
 
   var _blockableOverlayState = BlockableOverlayState();
 
@@ -112,11 +116,13 @@ class _RemotePageState extends State<RemotePage>
     _ffi = FFI(widget.sessionId);
     Get.put<FFI>(_ffi, tag: widget.id);
     _ffi.imageModel.addCallbackOnFirstImage((String peerId) {
+      _ffi.canvasModel.activateLocalCursor();
       showKBLayoutTypeChooserIfNeeded(
           _ffi.ffiModel.pi.platform, _ffi.dialogManager);
       _ffi.recordingModel
           .updateStatus(bind.sessionGetIsRecording(sessionId: _ffi.sessionId));
     });
+    _ffi.canvasModel.initializeEdgeScrollFallback(this);
     _ffi.start(
       widget.id,
       password: widget.password,
@@ -132,9 +138,7 @@ class _RemotePageState extends State<RemotePage>
       _ffi.dialogManager
           .showLoading(translate('Connecting...'), onCancel: closeConnection);
     });
-    if (!isLinux) {
-      WakelockPlus.enable();
-    }
+    WakelockManager.enable(_uniqueKey);
 
     _ffi.ffiModel.updateEventListener(sessionId, widget.id);
     if (!isWeb) bind.pluginSyncUi(syncTo: kAppTypeDesktopRemote);
@@ -200,26 +204,20 @@ class _RemotePageState extends State<RemotePage>
     if (isWindows) {
       _isWindowBlur = false;
     }
-    if (!isLinux) {
-      WakelockPlus.enable();
-    }
+    WakelockManager.enable(_uniqueKey);
   }
 
   // When the window is unminimized, onWindowMaximize or onWindowRestore can be called when the old state was maximized or not.
   @override
   void onWindowMaximize() {
     super.onWindowMaximize();
-    if (!isLinux) {
-      WakelockPlus.enable();
-    }
+    WakelockManager.enable(_uniqueKey);
   }
 
   @override
   void onWindowMinimize() {
     super.onWindowMinimize();
-    if (!isLinux) {
-      WakelockPlus.disable();
-    }
+    WakelockManager.disable(_uniqueKey);
   }
 
   @override
@@ -262,9 +260,7 @@ class _RemotePageState extends State<RemotePage>
       await SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
           overlays: SystemUiOverlay.values);
     }
-    if (!isLinux) {
-      await WakelockPlus.disable();
-    }
+    WakelockManager.disable(_uniqueKey);
     await Get.delete<FFI>(tag: widget.id);
     removeSharedStates(widget.id);
   }
@@ -395,7 +391,7 @@ class _RemotePageState extends State<RemotePage>
     super.build(context);
     return WillPopScope(
         onWillPop: () async {
-          clientClose(sessionId, _ffi.dialogManager);
+          clientClose(sessionId, _ffi);
           return false;
         },
         child: MultiProvider(providers: [
@@ -408,6 +404,8 @@ class _RemotePageState extends State<RemotePage>
   }
 
   void enterView(PointerEnterEvent evt) {
+    _ffi.canvasModel.rearmEdgeScroll();
+
     _cursorOverImage.value = true;
     _firstEnterImage.value = true;
     if (_onEnterOrLeaveImage4Toolbar != null) {
@@ -427,6 +425,8 @@ class _RemotePageState extends State<RemotePage>
   }
 
   void leaveView(PointerExitEvent evt) {
+    _ffi.canvasModel.disableEdgeScroll();
+
     if (_ffi.ffiModel.keyboard) {
       _ffi.inputModel.tryMoveEdgeOnExit(evt.position);
     }
@@ -499,7 +499,6 @@ class _RemotePageState extends State<RemotePage>
           () => _ffi.ffiModel.pi.isSet.isFalse
               ? Container(color: Colors.transparent)
               : Obx(() {
-                  widget.toolbarState.initShow(sessionId);
                   _ffi.textureModel.updateCurrentDisplay(peerDisplay.value);
                   return ImagePaint(
                     id: widget.id,
@@ -625,7 +624,7 @@ class _ImagePaintState extends State<ImagePaint> {
               onHover: (evt) {},
               child: child);
         });
-    if (c.imageOverflow.isTrue && c.scrollStyle == ScrollStyle.scrollbar) {
+    if (c.imageOverflow.isTrue && c.scrollStyle != ScrollStyle.scrollauto) {
       final paintWidth = c.getDisplayWidth() * s;
       final paintHeight = c.getDisplayHeight() * s;
       final paintSize = Size(paintWidth, paintHeight);
@@ -680,9 +679,20 @@ class _ImagePaintState extends State<ImagePaint> {
 
   Widget _buildScrollAutoNonTextureRender(
       ImageModel m, CanvasModel c, double s) {
+    double sizeScale = s;
+    if (widget.ffi.ffiModel.isPeerLinux) {
+      final displays = widget.ffi.ffiModel.pi.getCurDisplays();
+      if (displays.isNotEmpty) {
+        sizeScale = s / displays[0].scale;
+      }
+    }
     return CustomPaint(
       size: Size(c.size.width, c.size.height),
-      painter: ImagePainter(image: m.image, x: c.x / s, y: c.y / s, scale: s),
+      painter: ImagePainter(
+          image: m.image,
+          x: c.x / sizeScale,
+          y: c.y / sizeScale,
+          scale: sizeScale),
     );
   }
 
@@ -695,17 +705,19 @@ class _ImagePaintState extends State<ImagePaint> {
     if (rect == null) {
       return Container();
     }
+    final isPeerLinux = ffiModel.isPeerLinux;
     final curDisplay = ffiModel.pi.currentDisplay;
     for (var i = 0; i < displays.length; i++) {
       final textureId = widget.ffi.textureModel
           .getTextureId(curDisplay == kAllDisplayValue ? i : curDisplay);
       if (true) {
         // both "textureId.value != -1" and "true" seems ok
+        final sizeScale = isPeerLinux ? s / displays[i].scale : s;
         children.add(Positioned(
           left: (displays[i].x - rect.left) * s + offset.dx,
           top: (displays[i].y - rect.top) * s + offset.dy,
-          width: displays[i].width * s,
-          height: displays[i].height * s,
+          width: displays[i].width * sizeScale,
+          height: displays[i].height * sizeScale,
           child: Obx(() => Texture(
                 textureId: textureId.value,
                 filterQuality:
